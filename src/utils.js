@@ -125,13 +125,140 @@ const patchWWebLibrary = async (client) => {
         }
       }
 
-      return msgs.map(m => window.WWebJS.getMessageModel(m))
+      // Same guard as getChats: one message that cannot be modelled must not
+      // reject the entire fetch.
+      return msgs.map(m => {
+        try {
+          return window.WWebJS.getMessageModel(m)
+        } catch (error) {
+          console.warn('getMessageModel failed, skipping message', m?.id?.id, error?.message)
+          return null
+        }
+      }).filter(Boolean)
     }, this.id._serialized, searchOptions)
 
     return messages.map(m => new Message(this.client, m))
   }
 
   await client.pupPage.evaluate(() => {
+    // WhatsApp Web renamed the serialized message-key property, so a key may
+    // carry either `_serialized` or `$1`. Reading the old name alone yields
+    // undefined, which reaches IndexedDB as a missing key and throws
+    // "Failed to execute 'get' on 'IDBObjectStore'".
+    const getMsgKeyId = (key) => key?._serialized ?? key?.$1 ?? null
+
+    // Restore `_serialized` on the message-key class itself, so the many places
+    // in whatsapp-web.js that read it keep working. Without this, sendMessage's
+    // final `Msg.get(newMsgKey._serialized)` looks up undefined and returns no
+    // message, leaving callers with a bare {"success":true} and no message id.
+    try {
+      const msgKeyModule = window.require('WAWebMsgKey')
+      const MsgKey = msgKeyModule?.default ?? msgKeyModule
+      const proto = MsgKey?.prototype
+      if (proto && !('_serialized' in proto)) {
+        Object.defineProperty(proto, '_serialized', {
+          configurable: true,
+          get () { return this.$1 }
+        })
+        console.warn('applied _serialized fallback to WAWebMsgKey')
+      }
+    } catch (error) {
+      console.warn('could not patch WAWebMsgKey', error?.message)
+    }
+
+    // Message models are serialized plain objects, so the getter above does not
+    // reach them. Mirror `$1` onto `_serialized` so API consumers keep seeing
+    // the message id they have always received.
+    const originalGetMessageModel = window.WWebJS.getMessageModel
+    window.WWebJS.getMessageModel = (message) => {
+      const msg = originalGetMessageModel(message)
+      if (msg?.id && msg.id._serialized === undefined && msg.id.$1 !== undefined) {
+        msg.id._serialized = msg.id.$1
+      }
+      return msg
+    }
+
+    // Reimplements window.WWebJS.getChatModel so that the parts which break on
+    // LID-addressed chats degrade instead of rejecting. Upstream lets any of
+    // them fail the whole model, which surfaced as {"success":false,"error":"r"}
+    // from every chat endpoint. Keep in sync with whatsapp-web.js
+    // src/util/Injected/Utils.js. See avoylenko/wwebjs-api#147 and
+    // wwebjs/whatsapp-web.js#201845.
+    window.WWebJS.getChatModel = async (chat, { isChannel = false } = {}) => {
+      if (!chat) return null
+
+      const model = chat.serialize()
+      model.isGroup = false
+      model.isMuted = chat.mute?.expiration !== 0
+      if (isChannel) {
+        model.isChannel = window.require('WAWebChatGetters').getIsNewsletter(chat)
+      } else {
+        model.formattedTitle = chat.formattedTitle
+      }
+
+      if (chat.groupMetadata) {
+        model.isGroup = true
+        try {
+          const chatWid = window.require('WAWebWidFactory').createWid(chat.id._serialized)
+          const collections = window.require('WAWebCollections')
+          const groupMetadata = collections.GroupMetadata || collections.WAWebGroupMetadataCollection
+          await groupMetadata.update(chatWid)
+        } catch (error) {
+          // Only refreshes the cached metadata serialized just below.
+          console.warn('groupMetadata.update failed for', chat.id?._serialized, error?.message)
+        }
+        let toPn = null
+        try {
+          toPn = window.require('WAWebLidMigrationUtils').toPn
+        } catch (error) {
+          toPn = null
+        }
+        const serializedMetadata = chat.groupMetadata.serialize()
+        for (const p of serializedMetadata.participants || []) {
+          try {
+            p.id = (toPn ? toPn(p.id) : null) ?? p.id
+          } catch (error) {
+            // No phone mapping for this participant, keep the LID id.
+          }
+        }
+        model.groupMetadata = serializedMetadata
+        model.isReadOnly = chat.groupMetadata.announce
+      }
+
+      if (chat.newsletterMetadata) {
+        try {
+          const collections = window.require('WAWebCollections')
+          const newsletterMetadata = collections.NewsletterMetadataCollection || collections.WAWebNewsletterMetadataCollection
+          await newsletterMetadata.update(chat.id)
+          model.channelMetadata = chat.newsletterMetadata.serialize()
+          model.channelMetadata.createdAtTs = chat.newsletterMetadata.creationTime
+        } catch (error) {
+          console.warn('newsletterMetadata.update failed for', chat.id?._serialized, error?.message)
+        }
+      }
+
+      model.lastMessage = null
+      const lastKeyId = getMsgKeyId(chat.lastReceivedKey)
+      if (model.msgs && model.msgs.length && lastKeyId) {
+        try {
+          const Msg = window.require('WAWebCollections').Msg
+          const lastMessage = Msg.get(lastKeyId) || (await Msg.getMessagesById([lastKeyId]))?.messages?.[0]
+          if (lastMessage) {
+            model.lastMessage = window.WWebJS.getMessageModel(lastMessage)
+          }
+        } catch (error) {
+          console.warn('lastMessage lookup failed for', chat.id?._serialized, error?.message)
+        }
+      }
+
+      // Live collections that puppeteer cannot serialize.
+      delete model.msgs
+      delete model.msgUnsyncedButtonReplyMsgs
+      delete model.unsyncedButtonReplies
+
+      return model
+    }
+
     // hotfix for https://github.com/pedroslopez/whatsapp-web.js/pull/3643
     window.WWebJS.getChats = async (searchOptions = {}) => {
       const chatFilter = (c) => {
@@ -148,9 +275,20 @@ const patchWWebLibrary = async (client) => {
 
       const filteredChats = allChats.filter(chatFilter)
 
-      return await Promise.all(
-        filteredChats.map(chat => window.WWebJS.getChatModel(chat))
+      // Last resort: a chat that still cannot be modelled is skipped rather than
+      // rejecting the whole listing.
+      const chats = await Promise.all(
+        filteredChats.map(async (chat) => {
+          try {
+            return await window.WWebJS.getChatModel(chat)
+          } catch (error) {
+            console.warn('skipping chat', chat?.id?._serialized, error?.message)
+            return null
+          }
+        })
       )
+
+      return chats.filter(Boolean)
     }
   })
 }
