@@ -19,7 +19,7 @@
     "qrcode-terminal": "^0.12.0",
     "swagger-ui-express": "^5.0.1",
     "whatsapp-web.js": "github:pedroslopez/whatsapp-web.js#main",
-    "ws": "^8.20.0"
+    "ws": "^8.21.3"
   },
   "devDependencies": {
     "eslint": "^8.38.0",
